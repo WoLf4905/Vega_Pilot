@@ -1,0 +1,4 @@
+Repository: https://github.com/mavlink/c_library_v2
+Commit: ee5827fcb834bf9e149dc2317fd444e4d1ef9d2e
+Protocol: MAVLink 2
+Dialect: common

@@ -66,7 +66,7 @@ CFLAGS = \
 	-Wall \
 	-g \
 	-include sys/cdefs.h \
-	-I$(INCLUDE_DIR)
+	-I$(INCLUDE_DIR) -Ilib/mavlink
 
 # -------------------- Assembly flags ------------------------
 
@@ -74,7 +74,7 @@ ASFLAGS = \
 	-march=$(ARCH) \
 	-mabi=$(ABI) \
 	-g \
-	-I$(INCLUDE_DIR)
+	-I$(INCLUDE_DIR) -Ilib/mavlink
 
 # -------------------- Linker flags --------------------------
 

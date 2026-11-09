@@ -1,229 +1,157 @@
-
-#include "uart.h"
-#include "ring_buffer.h"
-#include "interrupt.h"
-
 #include <stdint.h>
 
-#define RISCV_MSTATUS_MIE (1U << 3)
+#include "mavlink_transport.h"
+#include "mavlink_protocol.h"
+#include "timer.h"
 
-static ring_buffer_t rx_buffer;
-static ring_buffer_t tx_buffer;
+#define MAVLINK_SYSTEM_ID       1U
+#define MAVLINK_COMPONENT_ID    MAV_COMP_ID_AUTOPILOT1
 
-/* Save and disable global machine interrupts. */
-static inline uint32_t irq_save(void)
+#define UART_BAUD_RATE          115200U
+
+/*
+ * Send one HEARTBEAT message.
+ */
+static void send_heartbeat(void)
 {
-    uint32_t previous;
+    mavlink_message_t heartbeat;
 
-    __asm__ volatile (
-        "csrrc %0, mstatus, %1"
-        : "=r"(previous)
-        : "r"(RISCV_MSTATUS_MIE)
-        : "memory"
+    mavlink_msg_heartbeat_pack(
+        MAVLINK_SYSTEM_ID,
+        MAVLINK_COMPONENT_ID,
+        &heartbeat,
+        MAV_TYPE_QUADROTOR,
+        MAV_AUTOPILOT_GENERIC,
+        0U,
+        0U,
+        MAV_STATE_STANDBY
     );
 
-    return previous;
-}
-
-/* Restore the previous interrupt state. */
-static inline void irq_restore(uint32_t previous)
-{
-    if (previous & RISCV_MSTATUS_MIE)
-    {
-        __asm__ volatile (
-            "csrs mstatus, %0"
-            :
-            : "r"(RISCV_MSTATUS_MIE)
-            : "memory"
-        );
-    }
+    (void)mavlink_protocol_send(&heartbeat);
 }
 
 /*
- * Queue one byte for transmission.
+ * Application handler for incoming PING messages.
  *
- * Main loop = TX producer
- * UART ISR  = TX consumer
+ * This callback runs in main/application context,
+ * not inside the UART ISR.
  */
-static int uart0_write_async(uint8_t data)
+static void handle_ping(const mavlink_message_t *message)
 {
-    uint32_t previous = irq_save();
+    mavlink_ping_t incoming_ping;
+    mavlink_message_t ping_response;
 
-    if (!ring_buffer_push(&tx_buffer, data))
+    /*
+     * Decode the incoming PING payload.
+     */
+    mavlink_msg_ping_decode(message, &incoming_ping);
+
+    /*
+     * Check whether the PING targets this autopilot
+     * or is a broadcast request.
+     */
+    if ((incoming_ping.target_system != 0U &&
+         incoming_ping.target_system != MAVLINK_SYSTEM_ID) ||
+        (incoming_ping.target_component != 0U &&
+         incoming_ping.target_component != MAVLINK_COMPONENT_ID))
     {
-        irq_restore(previous);
-        return -1;
+        return;
     }
 
     /*
-     * Enable TX-empty interrupt after placing data
-     * in the queue. Keep this operation protected
-     * against an ISR race.
+     * Build the response addressed to the original sender.
      */
-    (void)uart_enable_tx_interrupt(UART_0);
-
-    irq_restore(previous);
-
-    return 0;
-}
-
-/*
- * Combined UART0 RX + TX interrupt handler.
- */
-static void uart0_isr(void)
-{
-    uint8_t received;
-    uint8_t transmit_byte;
-
-    uint32_t line_status;
-    uint32_t previous;
-
-    int available;
+    mavlink_msg_ping_pack(
+        MAVLINK_SYSTEM_ID,
+        MAVLINK_COMPONENT_ID,
+        &ping_response,
+        incoming_ping.time_usec,
+        incoming_ping.seq,
+        message->sysid,
+        message->compid
+    );
 
     /*
-     * ---------------- RX SERVICE ----------------
-     *
-     * Read all currently available bytes from UART.
-     * Put them into the RX ring buffer.
+     * Send the response through the protocol layer.
      */
-    do
-    {
-        available = uart_read_byte_with_status(
-            UART_0,
-            &received,
-            &line_status
-        );
-
-        if (available)
-        {
-            /*
-             * Queue received binary byte.
-             * No ASCII interpretation.
-             */
-            (void)ring_buffer_push(
-                &rx_buffer,
-                received
-            );
-        }
-
-    } while (available);
-
-    /*
-     * ---------------- TX SERVICE ----------------
-     *
-     * Transmit one byte when the UART reports
-     * that its transmit holding register is ready.
-     */
-    if (uart_tx_ready(UART_0))
-    {
-        /*
-         * Preserve the queue pop + empty check +
-         * interrupt disable as one protected operation.
-         *
-         * On this single-core target, the main loop
-         * cannot execute while this ISR is running.
-         */
-        previous = irq_save();
-
-        if (ring_buffer_pop(&tx_buffer, &transmit_byte))
-        {
-            uart_write_byte(UART_0, transmit_byte);
-
-            /*
-             * If the queue became empty, disable
-             * TX interrupt now.
-             */
-            if (ring_buffer_is_empty(&tx_buffer))
-            {
-                (void)uart_disable_tx_interrupt(UART_0);
-            }
-        }
-        else
-        {
-            (void)uart_disable_tx_interrupt(UART_0);
-        }
-
-        irq_restore(previous);
-    }
+    (void)mavlink_protocol_send(&ping_response);
 }
 
 int main(void)
 {
-    uart_config_t config =
-    {
-        .baud_rate = 115200U
-    };
-
-    uint8_t received;
-
     /*
-     * STEP 1: Initialize UART hardware.
+     * STEP 1:
+     * Initialize UART, ring buffers and interrupt controller.
      */
-    if (uart_init(UART_0, &config) != 0)
+    if (mavlink_transport_init(UART_BAUD_RATE) != 0)
     {
         while (1)
         {
+            __asm__ volatile ("wfi");
         }
     }
 
     /*
-     * STEP 2: Initialize software ring buffers.
+     * STEP 2:
+     * Initialize the MAVLink protocol parser and handlers.
      */
-    ring_buffer_init(&rx_buffer);
-    ring_buffer_init(&tx_buffer);
-
-    /*
-     * STEP 3: Initialize interrupt controller.
-     */
-    interrupt_init();
-
-    /*
-     * STEP 4: Register UART0 interrupt handler.
-     */
-    if (interrupt_register_handler(
-            VEGA_IRQ_UART0,
-            uart0_isr) != 0)
+    if (mavlink_protocol_init() != 0)
     {
         while (1)
         {
+            __asm__ volatile ("wfi");
         }
     }
 
     /*
-     * STEP 5: Enable UART peripheral RX interrupt.
+     * STEP 3:
+     * Register the PING application handler.
      */
-    if (uart_enable_rx_interrupt(UART_0) != 0)
+    if (mavlink_protocol_register_handler(
+            MAVLINK_MSG_ID_PING,
+            handle_ping) != 0)
     {
         while (1)
         {
+            __asm__ volatile ("wfi");
         }
     }
 
     /*
-     * STEP 6: Enable UART0 source in interrupt controller.
+     * STEP 4:
+     * Initialize the periodic Timer 0 interrupt.
      */
-    if (interrupt_enable_source(VEGA_IRQ_UART0) != 0)
+    if (timer0_init_1hz() != 0)
     {
         while (1)
         {
+            __asm__ volatile ("wfi");
         }
     }
 
     /*
-     * STEP 7: Main application loop.
-     *
-     * Consume received bytes from RX queue
-     * and enqueue the exact same bytes for TX.
-     *
-     * No special characters.
-     * No string handling.
-     * No ASCII conversion.
+     * STEP 5:
+     * Send the first HEARTBEAT immediately.
+     */
+    send_heartbeat();
+
+    /*
+     * STEP 6:
+     * Main application loop.
      */
     while (1)
     {
-        while (ring_buffer_pop(&rx_buffer, &received))
+        /*
+         * Receive, parse and dispatch complete MAVLink messages.
+         */
+        mavlink_protocol_process_rx();
+
+        /*
+         * Send periodic HEARTBEAT.
+         */
+        if (timer0_take_tick())
         {
-            (void)uart0_write_async(received);
+            send_heartbeat();
         }
     }
 
