@@ -16,6 +16,8 @@
 #define UART_LSR_DR       (1U << 0)
 #define UART_LSR_THRE     (1U << 5)
 #define UART_IER_RX_DATA_AVAILABLE (1U << 0)
+#define UART_IER_TX_EMPTY (1U << 1)
+#define RISCV_MSTATUS_MIE (1U << 3)
 
 static const uintptr_t uart_base[] =
 {
@@ -23,10 +25,52 @@ static const uintptr_t uart_base[] =
     0x10000200UL,
     0x10000300UL
 };
+/*
+ * Software copy of each UART's interrupt-enable register.
+ *
+ * Bit 0: RX interrupt
+ * Bit 1: TX interrupt
+ */
+static uint32_t uart_ier_shadow[3] = {0U, 0U, 0U};
 
 static inline volatile uint32_t *uart_reg(uart_id_t uart, uint32_t offset)
 {
     return (volatile uint32_t *)(uart_base[uart] + offset);
+}
+
+
+
+/*
+ * Disable machine interrupts and return their previous state.
+ */
+static inline uint32_t uart_irq_save(void)
+{
+    uint32_t previous;
+
+    __asm__ volatile (
+        "csrrc %0, mstatus, %1"
+        : "=r"(previous)
+        : "r"(RISCV_MSTATUS_MIE)
+        : "memory"
+    );
+
+    return previous;
+}
+
+/*
+ * Restore the previous machine-interrupt state.
+ */
+static inline void uart_irq_restore(uint32_t previous)
+{
+    if (previous & RISCV_MSTATUS_MIE)
+    {
+        __asm__ volatile (
+            "csrs mstatus, %0"
+            :
+            : "r"(RISCV_MSTATUS_MIE)
+            : "memory"
+        );
+    }
 }
 
 int uart_init(uart_id_t uart, const uart_config_t *config)
@@ -48,6 +92,7 @@ int uart_init(uart_id_t uart, const uart_config_t *config)
     /* DLAB=0: offset 0x04 is now IER. Configure 8N1 and disable IRQs. */
     *uart_reg(uart, UART_REG_LCR) = UART_LCR_8N1;
     *uart_reg(uart, UART_REG_IE) = 0U;
+    uart_ier_shadow[uart] = 0U;
     *uart_reg(uart, UART_REG_IIR_FCR) = 0U;
 
     __asm__ volatile ("fence" ::: "memory");
@@ -139,32 +184,92 @@ uint8_t uart_read_byte_blocking(uart_id_t uart)
 
 int uart_enable_rx_interrupt(uart_id_t uart)
 {
-    uint32_t lcr;
+    uint32_t previous;
 
     if ((unsigned int)uart > UART_2)
         return -1;
 
-    lcr = *uart_reg(uart, UART_REG_LCR);
-    lcr &= ~UART_LCR_DLAB;
-    *uart_reg(uart, UART_REG_LCR) = lcr;
-    *uart_reg(uart, UART_REG_IE) = UART_IER_RX_DATA_AVAILABLE;
+    previous = uart_irq_save();
+
+    /* Ensure DLAB = 0 so offset 0x04 refers to IER. */
+    *uart_reg(uart, UART_REG_LCR) &= ~UART_LCR_DLAB;
+
+    /* Enable RX while preserving other interrupt settings. */
+    uart_ier_shadow[uart] |= UART_IER_RX_DATA_AVAILABLE;
+
+    *uart_reg(uart, UART_REG_IE) = uart_ier_shadow[uart];
 
     __asm__ volatile ("fence" ::: "memory");
+
+    uart_irq_restore(previous);
+
+    return 0;
+}
+
+int uart_enable_tx_interrupt(uart_id_t uart)
+{
+    uint32_t previous;
+
+    if ((unsigned int)uart > UART_2)
+        return -1;
+
+    previous = uart_irq_save();
+
+    *uart_reg(uart, UART_REG_LCR) &= ~UART_LCR_DLAB;
+
+    /* Enable TX without disturbing RX. */
+    uart_ier_shadow[uart] |= UART_IER_TX_EMPTY;
+
+    *uart_reg(uart, UART_REG_IE) = uart_ier_shadow[uart];
+
+    __asm__ volatile ("fence" ::: "memory");
+
+    uart_irq_restore(previous);
+
+    return 0;
+}
+
+int uart_disable_tx_interrupt(uart_id_t uart)
+{
+    uint32_t previous;
+
+    if ((unsigned int)uart > UART_2)
+        return -1;
+
+    previous = uart_irq_save();
+
+    *uart_reg(uart, UART_REG_LCR) &= ~UART_LCR_DLAB;
+
+    /* Disable TX but preserve RX. */
+    uart_ier_shadow[uart] &= ~UART_IER_TX_EMPTY;
+
+    *uart_reg(uart, UART_REG_IE) = uart_ier_shadow[uart];
+
+    __asm__ volatile ("fence" ::: "memory");
+
+    uart_irq_restore(previous);
+
     return 0;
 }
 
 int uart_disable_interrupts(uart_id_t uart)
 {
-    uint32_t lcr;
+    uint32_t previous;
 
     if ((unsigned int)uart > UART_2)
         return -1;
 
-    lcr = *uart_reg(uart, UART_REG_LCR);
-    lcr &= ~UART_LCR_DLAB;
-    *uart_reg(uart, UART_REG_LCR) = lcr;
+    previous = uart_irq_save();
+
+    *uart_reg(uart, UART_REG_LCR) &= ~UART_LCR_DLAB;
+
+    uart_ier_shadow[uart] = 0U;
+
     *uart_reg(uart, UART_REG_IE) = 0U;
 
     __asm__ volatile ("fence" ::: "memory");
+
+    uart_irq_restore(previous);
+
     return 0;
 }

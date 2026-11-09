@@ -1,107 +1,150 @@
+
 #include "uart.h"
 #include "ring_buffer.h"
 #include "interrupt.h"
 
+#include <stdint.h>
+
+#define RISCV_MSTATUS_MIE (1U << 3)
+
 static ring_buffer_t rx_buffer;
+static ring_buffer_t tx_buffer;
 
-/* Written only by the UART ISR; read by main() for diagnostics. */
-static volatile uint32_t rx_interrupt_count;
-static volatile uint32_t rx_bytes_received;
-static volatile uint32_t uart_overrun_observations;
-static volatile uint32_t uart_parity_observations;
-static volatile uint32_t uart_framing_observations;
-
-static void uart0_rx_isr(void)
+/* Save and disable global machine interrupts. */
+static inline uint32_t irq_save(void)
 {
-    uint8_t received;
-    uint32_t line_status;
-    int available;
+    uint32_t previous;
 
-    ++rx_interrupt_count;
+    __asm__ volatile (
+        "csrrc %0, mstatus, %1"
+        : "=r"(previous)
+        : "r"(RISCV_MSTATUS_MIE)
+        : "memory"
+    );
+
+    return previous;
+}
+
+/* Restore the previous interrupt state. */
+static inline void irq_restore(uint32_t previous)
+{
+    if (previous & RISCV_MSTATUS_MIE)
+    {
+        __asm__ volatile (
+            "csrs mstatus, %0"
+            :
+            : "r"(RISCV_MSTATUS_MIE)
+            : "memory"
+        );
+    }
+}
+
+/*
+ * Queue one byte for transmission.
+ *
+ * Main loop = TX producer
+ * UART ISR  = TX consumer
+ */
+static int uart0_write_async(uint8_t data)
+{
+    uint32_t previous = irq_save();
+
+    if (!ring_buffer_push(&tx_buffer, data))
+    {
+        irq_restore(previous);
+        return -1;
+    }
 
     /*
-     * Read LSR and consume every currently available byte. The final
-     * no-data read also gives us one last LSR snapshot for error flags.
+     * Enable TX-empty interrupt after placing data
+     * in the queue. Keep this operation protected
+     * against an ISR race.
+     */
+    (void)uart_enable_tx_interrupt(UART_0);
+
+    irq_restore(previous);
+
+    return 0;
+}
+
+/*
+ * Combined UART0 RX + TX interrupt handler.
+ */
+static void uart0_isr(void)
+{
+    uint8_t received;
+    uint8_t transmit_byte;
+
+    uint32_t line_status;
+    uint32_t previous;
+
+    int available;
+
+    /*
+     * ---------------- RX SERVICE ----------------
+     *
+     * Read all currently available bytes from UART.
+     * Put them into the RX ring buffer.
      */
     do
     {
         available = uart_read_byte_with_status(
-            UART_0, &received, &line_status);
-
-        if ((line_status & UART_LINE_STATUS_OVERRUN) != 0U)
-            ++uart_overrun_observations;
-
-        if ((line_status & UART_LINE_STATUS_PARITY) != 0U)
-            ++uart_parity_observations;
-
-        if ((line_status & UART_LINE_STATUS_FRAMING) != 0U)
-            ++uart_framing_observations;
+            UART_0,
+            &received,
+            &line_status
+        );
 
         if (available)
         {
-            ++rx_bytes_received;
-            (void)ring_buffer_push(&rx_buffer, received);
+            /*
+             * Queue received binary byte.
+             * No ASCII interpretation.
+             */
+            (void)ring_buffer_push(
+                &rx_buffer,
+                received
+            );
         }
-    }
-    while (available);
-}
 
-static void uart_put_u32(uart_id_t uart, uint32_t value)
-{
-    char digits[10];
-    uint32_t count = 0U;
+    } while (available);
 
-    if (value == 0U)
+    /*
+     * ---------------- TX SERVICE ----------------
+     *
+     * Transmit one byte when the UART reports
+     * that its transmit holding register is ready.
+     */
+    if (uart_tx_ready(UART_0))
     {
-        uart_write_byte(uart, '0');
-        return;
+        /*
+         * Preserve the queue pop + empty check +
+         * interrupt disable as one protected operation.
+         *
+         * On this single-core target, the main loop
+         * cannot execute while this ISR is running.
+         */
+        previous = irq_save();
+
+        if (ring_buffer_pop(&tx_buffer, &transmit_byte))
+        {
+            uart_write_byte(UART_0, transmit_byte);
+
+            /*
+             * If the queue became empty, disable
+             * TX interrupt now.
+             */
+            if (ring_buffer_is_empty(&tx_buffer))
+            {
+                (void)uart_disable_tx_interrupt(UART_0);
+            }
+        }
+        else
+        {
+            (void)uart_disable_tx_interrupt(UART_0);
+        }
+
+        irq_restore(previous);
     }
-
-    while (value != 0U && count < sizeof(digits))
-    {
-        digits[count++] = (char)('0' + (value % 10U));
-        value /= 10U;
-    }
-
-    while (count > 0U)
-        uart_write_byte(uart, (uint8_t)digits[--count]);
-}
-
-static void print_uart_diagnostics(void)
-{
-    /* Aligned 32-bit reads are atomic on this RV32 target. */
-    uint32_t irq_count = rx_interrupt_count;
-    uint32_t byte_count = rx_bytes_received;
-    uint32_t overflow_count = rx_buffer.overflow_count;
-    uint32_t overrun_count = uart_overrun_observations;
-    uint32_t parity_count = uart_parity_observations;
-    uint32_t framing_count = uart_framing_observations;
-
-    uart_puts(UART_0, "\n========== UART DIAGNOSTICS ==========\n");
-
-    uart_puts(UART_0, "RX interrupt entries       : ");
-    uart_put_u32(UART_0, irq_count);
-    uart_puts(UART_0, "\n");
-
-    uart_puts(UART_0, "RX bytes read from UART    : ");
-    uart_put_u32(UART_0, byte_count);
-    uart_puts(UART_0, "\n");
-
-    uart_puts(UART_0, "Ring buffer overflows      : ");
-    uart_put_u32(UART_0, overflow_count);
-    uart_puts(UART_0, "\n");
-
-    uart_puts(UART_0, "LSR overrun observations   : ");
-    uart_put_u32(UART_0, overrun_count);
-    uart_puts(UART_0, "\n");
-
-    uart_puts(UART_0, "LSR parity observations    : ");
-    uart_put_u32(UART_0, parity_count);
-    uart_puts(UART_0, "\n");
-
-    uart_puts(UART_0, "LSR framing observations   : ");
-    uart_put_u32(UART_0, framing_count);
-    uart_puts(UART_0, "\n======================================\n");
 }
 
 int main(void)
@@ -110,8 +153,12 @@ int main(void)
     {
         .baud_rate = 115200U
     };
+
     uint8_t received;
 
+    /*
+     * STEP 1: Initialize UART hardware.
+     */
     if (uart_init(UART_0, &config) != 0)
     {
         while (1)
@@ -119,51 +166,64 @@ int main(void)
         }
     }
 
+    /*
+     * STEP 2: Initialize software ring buffers.
+     */
     ring_buffer_init(&rx_buffer);
-    rx_interrupt_count = 0U;
-    rx_bytes_received = 0U;
-    uart_overrun_observations = 0U;
-    uart_parity_observations = 0U;
-    uart_framing_observations = 0U;
+    ring_buffer_init(&tx_buffer);
 
+    /*
+     * STEP 3: Initialize interrupt controller.
+     */
     interrupt_init();
-    uart_puts(UART_0, "UART RX DIAGNOSTIC TEST\n");
 
-    if (interrupt_register_handler(VEGA_IRQ_UART0, uart0_rx_isr) != 0)
+    /*
+     * STEP 4: Register UART0 interrupt handler.
+     */
+    if (interrupt_register_handler(
+            VEGA_IRQ_UART0,
+            uart0_isr) != 0)
     {
-        uart_puts(UART_0, "IRQ registration failed\n");
         while (1)
         {
         }
     }
 
-    if (interrupt_enable_source(VEGA_IRQ_UART0) != 0)
-    {
-        uart_puts(UART_0, "IRQ enable failed\n");
-        while (1)
-        {
-        }
-    }
-
+    /*
+     * STEP 5: Enable UART peripheral RX interrupt.
+     */
     if (uart_enable_rx_interrupt(UART_0) != 0)
     {
-        uart_puts(UART_0, "UART RX IRQ failed\n");
         while (1)
         {
         }
     }
 
-    uart_puts(UART_0, "UART RX INTERRUPT ENABLED\n");
-    uart_puts(UART_0, "Echo enabled. Send '?' for diagnostics.\n");
+    /*
+     * STEP 6: Enable UART0 source in interrupt controller.
+     */
+    if (interrupt_enable_source(VEGA_IRQ_UART0) != 0)
+    {
+        while (1)
+        {
+        }
+    }
 
+    /*
+     * STEP 7: Main application loop.
+     *
+     * Consume received bytes from RX queue
+     * and enqueue the exact same bytes for TX.
+     *
+     * No special characters.
+     * No string handling.
+     * No ASCII conversion.
+     */
     while (1)
     {
         while (ring_buffer_pop(&rx_buffer, &received))
         {
-            if (received == '?')
-                print_uart_diagnostics();
-            else
-                uart_write_byte(UART_0, received);
+            (void)uart0_write_async(received);
         }
     }
 

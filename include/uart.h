@@ -41,6 +41,8 @@ int uart_read_byte_with_status(uart_id_t uart,
 uint8_t uart_read_byte_blocking(uart_id_t uart);
 int uart_tx_ready(uart_id_t uart);
 int uart_enable_rx_interrupt(uart_id_t uart);
+int uart_enable_tx_interrupt(uart_id_t uart);
+int uart_disable_tx_interrupt(uart_id_t uart);
 int uart_disable_interrupts(uart_id_t uart);
 
 #endif
